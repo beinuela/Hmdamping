@@ -8,7 +8,6 @@ public class UserHolder {
 
     public static void saveUser(UserDTO user){tl.set(user);}
 
-
     public static UserDTO getUser(){
         return tl.get();
     }
