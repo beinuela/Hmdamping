@@ -1,7 +1,10 @@
 package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.bean.copier.CopyOptions;
+import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.RandomUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.LoginFormDTO;
 import com.hmdp.dto.Result;
@@ -9,12 +12,23 @@ import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.UserMapper;
 import com.hmdp.service.IUserService;
+import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RegexUtils;
+import com.hmdp.utils.SystemConstants;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+
+import static com.hmdp.utils.RedisConstants.*;
 import static com.hmdp.utils.SystemConstants.USER_NICK_NAME_PREFIX;
 
 /**
@@ -28,61 +42,84 @@ import static com.hmdp.utils.SystemConstants.USER_NICK_NAME_PREFIX;
 @Slf4j
 @Service
 public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IUserService {
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
 
+    /**
+     * 发送验证码
+     *
+     * @param phone
+     * @param session
+     * @return
+     */
     @Override
     public Result sendCode(String phone, HttpSession session) {
-        // TODO 校验手机号
-        //如果不符合，返回错误信息
+        // 1、判断手机号是否合法
         if (RegexUtils.isPhoneInvalid(phone)) {
-            return Result.fail("手机号格式错误");
+            return Result.fail("手机号格式不正确");
         }
-        //如果符合
+        // 2、手机号合法，生成验证码，并保存到Redis中
         String code = RandomUtil.randomNumbers(6);
-
-        //保存验证码到session
-        session.setAttribute("code", code);
-
-        //发送验证码
-        log.debug("发送验证码成功:{}", code);
-
-        //返回ok
+        stringRedisTemplate.opsForValue().set(LOGIN_CODE_KEY + phone, code,
+                RedisConstants.LOGIN_CODE_TTL, TimeUnit.MINUTES);
+        // 3、发送验证码
+        log.info("验证码:{}", code);
         return Result.ok();
     }
 
+    /**
+     * 用户登录
+     *
+     * @param loginForm
+     * @param session
+     * @return
+     */
     @Override
     public Result login(LoginFormDTO loginForm, HttpSession session) {
-        // TODO 校验手机号
         String phone = loginForm.getPhone();
-        //校验手机号
-        if (RegexUtils.isPhoneInvalid(phone)) {
-            return Result.fail("手机号格式错误");
-        }
-        //校验验证码
-        Object cachecode = session.getAttribute("code");
         String code = loginForm.getCode();
-        //不一致报错
-        if (cachecode == null || !cachecode.toString().equals(code)) {
-            return Result.fail("验证码错误");
+        // 1、判断手机号是否合法
+        if (RegexUtils.isPhoneInvalid(phone)) {
+            return Result.fail("手机号格式不正确");
         }
-
-        //一致，以新手机号查询用户
-        User user = query().eq("phone", phone).one();
-        //判断用户是否存在
-        if (user == null) {
-            //不存在，创建新用户并保存
+        // 2、判断验证码是否正确
+        String redisCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
+        if (code == null || !code.equals(redisCode)) {
+            return Result.fail("验证码不正确");
+        }
+        // 3、判断手机号是否是已存在的用户
+        User user = this.getOne(new LambdaQueryWrapper<User>()
+                .eq(User::getPhone, phone));
+        if (Objects.isNull(user)) {
+            // 用户不存在，需要注册
             user = createUserWithPhone(phone);
         }
-        session.setAttribute("user", BeanUtil.copyProperties(user, UserDTO.class));
+        // 4、保存用户信息到Redis中，便于后面逻辑的判断（比如登录判断、随时取用户信息，减少对数据库的查询）
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        // 将对象中字段全部转成string类型，StringRedisTemplate只能存字符串类型的数据
+        Map<String, Object> userMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
+                CopyOptions.create().setIgnoreNullValue(true).
+                        setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString()));
+        String token = UUID.randomUUID().toString(true);
+        String tokenKey = LOGIN_USER_KEY + token;
+        stringRedisTemplate.opsForHash().putAll(tokenKey, userMap);
+        stringRedisTemplate.expire(tokenKey, LOGIN_USER_TTL, TimeUnit.MINUTES);
 
-        //保存用户信息到session中
-
-        return Result.ok();
+        return Result.ok(token);
     }
+
+    /**
+     * 根据手机号创建用户并保存
+     *
+     * @param phone
+     * @return
+     */
     private User createUserWithPhone(String phone) {
         User user = new User();
         user.setPhone(phone);
-        user.setNickName(USER_NICK_NAME_PREFIX + RandomUtil.randomString(10));
-        save(user);
+        user.setNickName(SystemConstants.USER_NICK_NAME_PREFIX + RandomUtil.randomString(10));
+        this.save(user);
         return user;
     }
+
 }
